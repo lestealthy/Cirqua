@@ -1,0 +1,1987 @@
+```cpp
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ============================================================
+// NODE 1 TANK SENSOR
+// ============================================================
+
+#define TRIG_PIN 2
+#define ECHO_PIN 17
+
+
+// ============================================================
+// UART CONFIGURATION
+// ============================================================
+
+// ------------------------------------------------------------
+// NODE 1 -> NODE 2
+// ------------------------------------------------------------
+//
+// Existing connection:
+//
+// Node 1 TX = GPIO 33
+// Node 2 RX = GPIO 25
+//
+// ------------------------------------------------------------
+
+HardwareSerial OutSerial(2);
+
+
+// ------------------------------------------------------------
+// NODE 2 -> NODE 1
+// ------------------------------------------------------------
+//
+// Reverse communication:
+//
+// Node 2 TX = GPIO 26
+// Node 1 RX = GPIO 25
+//
+// Node 1 TX = GPIO 26
+// Node 2 RX = GPIO 25
+//
+// UART1 is used here.
+// ------------------------------------------------------------
+
+HardwareSerial InSerial(1);
+
+
+// ============================================================
+// LCD
+// ============================================================
+
+LiquidCrystal_I2C lcd(0x27, 16, 4);
+
+
+// ============================================================
+// NODE CONFIGURATION
+// ============================================================
+
+const String NODE_NAME = "node1";
+
+
+// ============================================================
+// TANK DIMENSIONS
+// ============================================================
+
+const float TANK_HEIGHT = 260.0;
+const float TANK_RADIUS = 110.0;
+
+
+// ============================================================
+// NODE 2 RECEIVE BUFFER
+// ============================================================
+
+String node2RxBuffer = "";
+
+
+// ============================================================
+// LAST RECEIVED NODE 2 VALUES
+// ============================================================
+
+// Dissolved oxygen
+float node2DO = -1.0;
+
+// DS18B20 submerged temperature
+float node2WaterTemp = -127.0;
+
+// Node 2 / Feeding Tank volume
+int node2Volume = -1;
+
+// DHT11 ambient temperature
+float node2AmbientTemp = -127.0;
+
+// DHT11 humidity
+float node2Humidity = -1.0;
+
+
+// ============================================================
+// NODE 2 COMMUNICATION STATUS
+// ============================================================
+
+// millis() timestamp of the last complete Node 2 packet
+unsigned long lastNode2Packet = 0;
+
+// Consider Node 2 communication lost after this time
+const unsigned long NODE2_TIMEOUT = 3000;
+
+
+// ============================================================
+// NODE 2 PACKET VALIDITY
+// ============================================================
+
+bool node2PacketValid = false;
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+    Serial.begin(115200);
+
+
+    // ========================================================
+    // NODE 1 -> NODE 2
+    // ========================================================
+
+    OutSerial.begin(
+        9600,
+        SERIAL_8N1,
+        32,     // RX
+        33      // TX
+    );
+
+
+    // ========================================================
+    // NODE 2 <=> NODE 1
+    // ========================================================
+    //
+    // GPIO25 = RX
+    // GPIO26 = TX
+    //
+    // This UART is used for receiving Node 2 data.
+    //
+    // ========================================================
+
+    InSerial.begin(
+        9600,
+        SERIAL_8N1,
+        25,     // RX
+        26      // TX
+    );
+
+
+    // ========================================================
+    // LCD
+    // ========================================================
+
+    lcd.begin(16, 4);
+    lcd.backlight();
+
+
+    // ========================================================
+    // ULTRASONIC
+    // ========================================================
+
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+
+
+    // ========================================================
+    // STARTUP
+    // ========================================================
+
+    Serial.println();
+    Serial.println("================================");
+    Serial.println("NODE 1 STARTED");
+    Serial.println("================================");
+
+    Serial.println("NODE 1 -> NODE 2");
+    Serial.println("Baud: 9600");
+    Serial.println("TX: GPIO33");
+
+    Serial.println();
+
+    Serial.println("NODE 2 -> NODE 1");
+    Serial.println("Baud: 9600");
+    Serial.println("RX: GPIO25");
+    Serial.println("TX: GPIO26");
+
+    Serial.println("================================");
+
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("Water Monitor");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Booting...");
+
+    delay(500);
+
+    lcd.clear();
+}
+
+
+// ============================================================
+// READ NODE 1 TANK VOLUME
+// ============================================================
+
+int getSensorValue()
+{
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+
+    digitalWrite(TRIG_PIN, LOW);
+
+
+    long duration =
+        pulseIn(
+            ECHO_PIN,
+            HIGH,
+            30000
+        );
+
+
+    float distance =
+        (duration * 0.0343 / 2.0) - 12.5;
+
+
+    float waterHeight =
+        TANK_HEIGHT - distance;
+
+
+    if (waterHeight < 0)
+        waterHeight = 0;
+
+
+    float volumeLiters =
+        (
+            3.14159 *
+            TANK_RADIUS *
+            TANK_RADIUS *
+            waterHeight
+        ) / 1000.0;
+
+
+    return volumeLiters * 2;
+}
+
+
+// ============================================================
+// PARSE A NODE 2 FIELD
+// ============================================================
+//
+// Extracts:
+//
+// DO
+// Temp
+// TBV
+// AT
+// AH
+//
+// Example:
+//
+// |DO:8|Temp:25|TBV:3500|AT:27|AH:61|node2:1
+//
+// ============================================================
+
+String getField(
+    String packet,
+    String fieldName
+)
+{
+    String search =
+        "|" + fieldName + ":";
+
+
+    int start =
+        packet.indexOf(search);
+
+
+    if (start < 0)
+        return "";
+
+
+    start += search.length();
+
+
+    int end =
+        packet.indexOf(
+            "|",
+            start
+        );
+
+
+    if (end < 0)
+    {
+        end =
+            packet.indexOf(
+                ";",
+                start
+            );
+    }
+
+
+    if (end < 0)
+        end = packet.length();
+
+
+    return packet.substring(
+        start,
+        end
+    );
+}
+
+
+// ============================================================
+// PROCESS COMPLETE NODE 2 PACKET
+// ============================================================
+
+void processNode2Packet(
+    String packet
+)
+{
+    packet.trim();
+
+
+    Serial.println();
+    Serial.println(">>> NODE 2 DATA RECEIVED <<<");
+    Serial.println(packet);
+
+
+    // --------------------------------------------------------
+    // DO
+    // --------------------------------------------------------
+
+    String doValue =
+        getField(
+            packet,
+            "DO"
+        );
+
+
+    if (doValue.length() > 0)
+    {
+        node2DO =
+            doValue.toFloat();
+    }
+
+
+    // --------------------------------------------------------
+    // WATER TEMPERATURE
+    // --------------------------------------------------------
+
+    String tempValue =
+        getField(
+            packet,
+            "Temp"
+        );
+
+
+    if (tempValue.length() > 0)
+    {
+        node2WaterTemp =
+            tempValue.toFloat();
+    }
+
+
+    // --------------------------------------------------------
+    // FEEDING TANK VOLUME
+    // --------------------------------------------------------
+
+    String volumeValue =
+        getField(
+            packet,
+            "TBV"
+        );
+
+
+    if (volumeValue.length() > 0)
+    {
+        node2Volume =
+            volumeValue.toInt();
+    }
+
+
+    // --------------------------------------------------------
+    // AMBIENT TEMPERATURE
+    // --------------------------------------------------------
+
+    String ambientTempValue =
+        getField(
+            packet,
+            "AT"
+        );
+
+
+    if (ambientTempValue.length() > 0)
+    {
+        node2AmbientTemp =
+            ambientTempValue.toFloat();
+    }
+
+
+    // --------------------------------------------------------
+    // AMBIENT HUMIDITY
+    // --------------------------------------------------------
+
+    String humidityValue =
+        getField(
+            packet,
+            "AH"
+        );
+
+
+    if (humidityValue.length() > 0)
+    {
+        node2Humidity =
+            humidityValue.toFloat();
+    }
+
+
+    // --------------------------------------------------------
+    // CHECK WHETHER ALL REQUIRED DATA EXISTS
+    // --------------------------------------------------------
+
+    if (
+        doValue.length() > 0 &&
+        tempValue.length() > 0 &&
+        volumeValue.length() > 0 &&
+        ambientTempValue.length() > 0 &&
+        humidityValue.length() > 0
+    )
+    {
+        node2PacketValid = true;
+        lastNode2Packet = millis();
+    }
+    else
+    {
+        node2PacketValid = false;
+    }
+
+
+    // --------------------------------------------------------
+    // DEBUG
+    // --------------------------------------------------------
+
+    Serial.print("DO: ");
+    Serial.println(node2DO);
+
+    Serial.print("Water Temp: ");
+    Serial.println(node2WaterTemp);
+
+    Serial.print("Feeding Tank Volume: ");
+    Serial.println(node2Volume);
+
+    Serial.print("Ambient Temp: ");
+    Serial.println(node2AmbientTemp);
+
+    Serial.print("Humidity: ");
+    Serial.println(node2Humidity);
+
+    Serial.println(
+        "================================"
+    );
+}
+
+
+// ============================================================
+// READ NODE 2 UART
+// ============================================================
+//
+// Non-blocking.
+//
+// Reads whatever is already available.
+//
+// A complete packet ends with '\n'.
+//
+// ============================================================
+
+void readNode2UART()
+{
+    while (InSerial.available())
+    {
+        char c =
+            InSerial.read();
+
+
+        // ----------------------------------------------------
+        // COMPLETE PACKET
+        // ----------------------------------------------------
+
+        if (c == '\n')
+        {
+            node2RxBuffer.trim();
+
+
+            if (node2RxBuffer.length() > 0)
+            {
+                processNode2Packet(
+                    node2RxBuffer
+                );
+            }
+
+
+            node2RxBuffer = "";
+        }
+
+
+        // ----------------------------------------------------
+        // IGNORE CR
+        // ----------------------------------------------------
+
+        else if (c == '\r')
+        {
+            continue;
+        }
+
+
+        // ----------------------------------------------------
+        // NORMAL CHARACTER
+        // ----------------------------------------------------
+
+        else
+        {
+            node2RxBuffer += c;
+
+
+            // Prevent runaway buffer
+            if (node2RxBuffer.length() > 250)
+            {
+                node2RxBuffer = "";
+
+                Serial.println(
+                    "WARNING: Node 2 RX buffer overflow"
+                );
+            }
+        }
+    }
+}
+
+
+// ============================================================
+// CHECK NODE 2 STATUS
+// ============================================================
+//
+// IMPORTANT:
+//
+// This is NOT a real alarm/status flag.
+//
+// It only determines whether communication/data are valid.
+//
+// ============================================================
+
+String getStatus()
+{
+    // No Node 2 packet received yet
+    if (!node2PacketValid)
+    {
+        return "WAITING";
+    }
+
+
+    // Node 2 stopped communicating
+    if (
+        millis() -
+        lastNode2Packet >
+        NODE2_TIMEOUT
+    )
+    {
+        return "ERROR";
+    }
+
+
+    // Data exists and is recent
+    return "NORMAL";
+}
+
+
+// ============================================================
+// PRINT FIXED-WIDTH LCD LINE
+// ============================================================
+//
+// Guarantees that the entire 16-character line is overwritten.
+//
+// ============================================================
+
+void printLCDLine(
+    byte row,
+    String text
+)
+{
+    lcd.setCursor(0, row);
+
+
+    // Trim to 16 characters
+    if (text.length() > 16)
+    {
+        text =
+            text.substring(
+                0,
+                16
+            );
+    }
+
+
+    lcd.print(text);
+
+
+    // Clear remaining characters
+    for (
+        int i = text.length();
+        i < 16;
+        i++
+    )
+    {
+        lcd.print(" ");
+    }
+}
+
+
+// ============================================================
+// UPDATE LCD
+// ============================================================
+
+void updateDisplay(
+    int collectionVolume
+)
+{
+    // --------------------------------------------------------
+    // LINE 1
+    // --------------------------------------------------------
+    //
+    // C12345L F1234L
+    //
+    // C = Collection Tank
+    // F = Feeding Tank
+    // --------------------------------------------------------
+
+    String line1 = "";
+
+    line1 += "C";
+    line1 += String(collectionVolume);
+    line1 += "L";
+
+    line1 += " F";
+
+    if (node2Volume >= 0)
+        line1 += String(node2Volume);
+    else
+        line1 += "----";
+
+    line1 += "L";
+
+
+    printLCDLine(
+        0,
+        line1
+    );
+
+
+    // --------------------------------------------------------
+    // LINE 2
+    // --------------------------------------------------------
+    //
+    // DO12,3g/L T25,4C
+    //
+    // 16 characters maximum
+    // --------------------------------------------------------
+
+    String line2 = "";
+
+    line2 += "DO";
+
+    if (node2DO >= 0)
+    {
+        line2 += String(
+            node2DO,
+            1
+        );
+    }
+    else
+    {
+        line2 += "--";
+    }
+
+    // Decimal separator requested by user
+    line2.replace(
+        ".",
+        ","
+    );
+
+    line2 += "g/L";
+
+    line2 += " T";
+
+    if (node2WaterTemp > -100)
+    {
+        line2 += String(
+            node2WaterTemp,
+            1
+        );
+    }
+    else
+    {
+        line2 += "--";
+    }
+
+    line2.replace(
+        ".",
+        ","
+    );
+
+    line2 += "C";
+
+
+    printLCDLine(
+        1,
+        line2
+    );
+
+
+    // --------------------------------------------------------
+    // LINE 3
+    // --------------------------------------------------------
+    //
+    // AT26,1C H58%
+    // --------------------------------------------------------
+
+    String line3 = "";
+
+    line3 += "AT";
+
+    if (node2AmbientTemp > -100)
+    {
+        line3 += String(
+            node2AmbientTemp,
+            1
+        );
+    }
+    else
+    {
+        line3 += "--";
+    }
+
+    line3.replace(
+        ".",
+        ","
+    );
+
+    line3 += "C H";
+
+    if (node2Humidity >= 0)
+    {
+        line3 += String(
+            node2Humidity,
+            0
+        );
+    }
+    else
+    {
+        line3 += "--";
+    }
+
+    line3 += "%";
+
+
+    printLCDLine(
+        2,
+        line3
+    );
+
+
+    // --------------------------------------------------------
+    // LINE 4
+    // --------------------------------------------------------
+
+    String statusLine =
+        "STATUS: " +
+        getStatus();
+
+
+    printLCDLine(
+        3,
+        statusLine
+    );
+}
+
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop()
+{
+    // ========================================================
+    // 1. READ NODE 2 DATA
+    // ========================================================
+
+    readNode2UART();
+
+
+    // ========================================================
+    // 2. READ COLLECTION TANK
+    // ========================================================
+
+    int collectionVolume =
+        getSensorValue();
+
+
+    // ========================================================
+    // 3. SEND COLLECTION TANK DATA TO NODE 2
+    // ========================================================
+
+    String outboundData =
+        "TAV:" +
+        String(collectionVolume) +
+        "|" +
+        NODE_NAME +
+        ":1;";
+
+
+    OutSerial.println(
+        outboundData
+    );
+
+
+    Serial.println(
+        "Sent: " +
+        outboundData
+    );
+
+
+    // ========================================================
+    // 4. UPDATE LCD
+    // ========================================================
+
+    updateDisplay(
+        collectionVolume
+    );
+
+
+    // ========================================================
+    // 5. LOOP DELAY
+    // ========================================================
+
+    delay(500);
+}
+```
+```cpp
+#include <Arduino.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <DHT.h>
+
+// ============================================================
+// PIN DEFINITIONS
+// ============================================================
+
+#define TEMP_PIN 4
+#define DO_PIN   34
+
+#define TRIG_PIN 16
+#define ECHO_PIN 17
+
+// DHT11
+// CHANGE THIS PIN IF YOUR DHT11 IS CONNECTED ELSEWHERE
+#define DHT_PIN 27
+#define DHT_TYPE DHT11
+
+
+// ============================================================
+// UART CONFIGURATION
+// ============================================================
+
+// ============================================================
+// NODE 1 <=> NODE 2
+// ============================================================
+//
+// Node 1 TX = GPIO 26
+// Node 2 RX = GPIO 25
+//
+// Node 2 TX = GPIO 26
+// Node 1 RX = GPIO 25
+//
+// Same UART is now BIDIRECTIONAL.
+// ============================================================
+
+HardwareSerial InSerial(2);
+
+
+// ============================================================
+// NODE 2 -> NODE 3
+// ============================================================
+//
+// Node 2 TX = GPIO 33
+// Node 3 RX = GPIO 32
+//
+// ============================================================
+
+HardwareSerial OutSerial(1);
+
+
+// ============================================================
+// NODE CONFIGURATION
+// ============================================================
+
+const String NODE_NAME = "node2";
+
+
+// ============================================================
+// TANK DIMENSIONS
+// ============================================================
+
+const float TANK_HEIGHT = 178.0;
+const float TANK_RADIUS = 59.5;
+
+
+// ============================================================
+// DO SENSOR CONFIGURATION
+// ============================================================
+
+const float VREF = 5000.0;
+const int ADC_RESOLUTION = 4095;
+
+const float TWO_POINT_VOLTAGE = 1000.0;
+
+
+// ============================================================
+// TEMPERATURE SENSOR
+// ============================================================
+
+OneWire oneWire(TEMP_PIN);
+DallasTemperature sensors(&oneWire);
+
+
+// ============================================================
+// DHT11
+// ============================================================
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+
+// ============================================================
+// NODE 1 BUFFER
+// ============================================================
+
+// Raw characters currently being received
+String node1RxBuffer = "";
+
+
+// LAST COMPLETE PACKET RECEIVED FROM NODE 1
+//
+// Example:
+//
+// |DO:8|Temp:25|TBV:123|node1:1
+//
+// This value stays unchanged until another complete
+// Node 1 packet arrives.
+
+String lastNode1Data = "";
+
+
+// ============================================================
+// SENSOR VALUES
+// ============================================================
+
+int currentTemp = -127;
+int currentDO = 0;
+int currentVolume = -1;
+
+// DHT11 values
+int currentAmbientTemp = -127;
+int currentHumidity = -1;
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+    Serial.begin(115200);
+
+    // --------------------------------------------------------
+    // Node 1 <=> Node 2
+    // --------------------------------------------------------
+
+    InSerial.begin(
+        9600,
+        SERIAL_8N1,
+        25,     // Node 2 RX
+        26      // Node 2 TX
+    );
+
+
+    // --------------------------------------------------------
+    // Node 2 -> Node 3
+    // --------------------------------------------------------
+
+    OutSerial.begin(
+        9600,
+        SERIAL_8N1,
+        32,     // RX
+        33      // TX
+    );
+
+
+    // --------------------------------------------------------
+    // DS18B20
+    // --------------------------------------------------------
+
+    sensors.begin();
+
+    sensors.setWaitForConversion(true);
+
+
+    // --------------------------------------------------------
+    // DHT11
+    // --------------------------------------------------------
+
+    dht.begin();
+
+
+    // --------------------------------------------------------
+    // Ultrasonic
+    // --------------------------------------------------------
+
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+
+    digitalWrite(TRIG_PIN, LOW);
+
+
+    // --------------------------------------------------------
+    // ADC
+    // --------------------------------------------------------
+
+    analogReadResolution(12);
+
+
+    // --------------------------------------------------------
+    // Startup message
+    // --------------------------------------------------------
+
+    Serial.println();
+    Serial.println("================================");
+    Serial.println("NODE 2 INITIALIZED");
+    Serial.println("================================");
+
+    Serial.println("NODE 1 <=> NODE 2");
+    Serial.println("Baud: 9600");
+    Serial.println("Node 1 TX -> Node 2 RX: GPIO26 -> GPIO25");
+    Serial.println("Node 2 TX -> Node 1 RX: GPIO26 -> GPIO25");
+
+    Serial.println();
+
+    Serial.println("NODE 2 -> NODE 3");
+    Serial.println("Baud: 9600");
+    Serial.println("Node 2 TX: GPIO33");
+    Serial.println("Node 3 RX: GPIO32");
+
+    Serial.println();
+
+    Serial.print("DHT11 GPIO: ");
+    Serial.println(DHT_PIN);
+
+    Serial.println();
+
+    Serial.println("Last-known Node 1 buffering: ENABLED");
+    Serial.println("Reverse Node 2 -> Node 1 data: ENABLED");
+    Serial.println("================================");
+}
+
+
+// ============================================================
+// READ NODE 1 UART
+// ============================================================
+//
+// Node 1 is expected to send:
+//
+// |DO:8|Temp:25|TBV:123|node1:1;
+//
+// followed by '\n' if using Serial.println().
+//
+// IMPORTANT:
+//
+// We do NOT validate the contents.
+//
+// Whatever complete packet Node 1 sends is accepted.
+//
+// This function NEVER waits for Node 1.
+// It only reads whatever bytes are already available.
+//
+// ============================================================
+
+void readNode1UART()
+{
+    while (InSerial.available())
+    {
+        char c = InSerial.read();
+
+
+        // ----------------------------------------------------
+        // END OF PACKET
+        // ----------------------------------------------------
+
+        if (c == '\n')
+        {
+            node1RxBuffer.trim();
+
+
+            if (node1RxBuffer.length() > 0)
+            {
+                // ------------------------------------------------
+                // NEW VALID COMPLETE NODE 1 PACKET
+                // ------------------------------------------------
+
+                lastNode1Data = node1RxBuffer;
+
+
+                Serial.println();
+                Serial.println(">>> NEW NODE 1 DATA RECEIVED <<<");
+                Serial.print("Node 1: ");
+                Serial.println(lastNode1Data);
+                Serial.println("================================");
+            }
+
+
+            // Start collecting the next packet
+            node1RxBuffer = "";
+        }
+
+
+        // ----------------------------------------------------
+        // IGNORE CR
+        // ----------------------------------------------------
+
+        else if (c == '\r')
+        {
+            continue;
+        }
+
+
+        // ----------------------------------------------------
+        // NORMAL CHARACTER
+        // ----------------------------------------------------
+
+        else
+        {
+            node1RxBuffer += c;
+
+
+            // Prevent runaway buffer
+            if (node1RxBuffer.length() > 250)
+            {
+                node1RxBuffer = "";
+
+                Serial.println(
+                    "WARNING: Node 1 RX buffer overflow"
+                );
+            }
+        }
+    }
+}
+
+
+// ============================================================
+// READ DS18B20 TEMPERATURE
+// ============================================================
+
+int readTemperature()
+{
+    sensors.requestTemperatures();
+
+    float tempC = sensors.getTempCByIndex(0);
+
+
+    if (tempC == DEVICE_DISCONNECTED_C)
+    {
+        Serial.println(
+            "WARNING: DS18B20 disconnected!"
+        );
+
+        return -127;
+    }
+
+
+    return (int)round(tempC);
+}
+
+
+// ============================================================
+// READ DHT11
+// ============================================================
+//
+// DHT11 provides:
+//
+// - Ambient temperature
+// - Ambient humidity
+//
+// Both are integer values because DHT11 itself has
+// limited resolution.
+//
+// ============================================================
+
+void readDHT11()
+{
+    float humidity = dht.readHumidity();
+    float ambientTemp = dht.readTemperature();
+
+
+    if (isnan(humidity) || isnan(ambientTemp))
+    {
+        Serial.println(
+            "WARNING: DHT11 read failed!"
+        );
+
+        currentAmbientTemp = -127;
+        currentHumidity = -1;
+
+        return;
+    }
+
+
+    currentAmbientTemp = (int)round(ambientTemp);
+    currentHumidity = (int)round(humidity);
+}
+
+
+// ============================================================
+// READ DISSOLVED OXYGEN
+// ============================================================
+
+int readDissolvedOxygen(int temp)
+{
+    int rawAdc = analogRead(DO_PIN);
+
+
+    float doVoltage =
+        rawAdc *
+        (VREF / (float)ADC_RESOLUTION);
+
+
+    const float saturationDoAt25C = 8.26;
+
+
+    float compFactor =
+        1.0 +
+        (temp - 25.0) *
+        (-0.02);
+
+
+    float dissolvedOxygen =
+        (doVoltage / TWO_POINT_VOLTAGE) *
+        saturationDoAt25C *
+        compFactor;
+
+
+    if (dissolvedOxygen < 0)
+        dissolvedOxygen = 0;
+
+
+    return (int)dissolvedOxygen;
+}
+
+
+// ============================================================
+// READ TANK VOLUME
+// ============================================================
+
+int readTankVolume()
+{
+    // --------------------------------------------------------
+    // Trigger ultrasonic pulse
+    // --------------------------------------------------------
+
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(5);
+
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(20);
+
+    digitalWrite(TRIG_PIN, LOW);
+
+
+    // --------------------------------------------------------
+    // Read echo
+    // --------------------------------------------------------
+
+    unsigned long duration =
+        pulseIn(
+            ECHO_PIN,
+            HIGH,
+            20000
+        );
+
+
+    // --------------------------------------------------------
+    // No echo
+    // --------------------------------------------------------
+
+    if (duration == 0)
+    {
+        Serial.println(
+            "WARNING: Ultrasonic sensor timeout"
+        );
+
+        return -1;
+    }
+
+
+    // --------------------------------------------------------
+    // Distance
+    // --------------------------------------------------------
+
+    float distance =
+        duration *
+        0.0343 /
+        2.0;
+
+
+    // --------------------------------------------------------
+    // Water height
+    // --------------------------------------------------------
+
+    float waterHeight =
+        TANK_HEIGHT -
+        distance;
+
+
+    if (waterHeight < 0)
+        waterHeight = 0;
+
+
+    if (waterHeight > TANK_HEIGHT)
+        waterHeight = TANK_HEIGHT;
+
+
+    // --------------------------------------------------------
+    // Cylinder volume
+    // --------------------------------------------------------
+
+    float volume =
+        PI *
+        TANK_RADIUS *
+        TANK_RADIUS *
+        waterHeight /
+        1000.0;
+
+
+    return (int)round(volume);
+}
+
+
+// ============================================================
+// BUILD NODE 2 DATA
+// ============================================================
+//
+// Existing fields are preserved:
+//
+// |DO:...|Temp:...|TBV:...|node2:1
+//
+// New DHT11 fields:
+//
+// |AT:...|AH:...
+//
+// AT = Ambient Temperature
+// AH = Ambient Humidity
+//
+// ============================================================
+
+String buildLocalSensorPacket()
+{
+    String packet = "";
+
+    // Existing DO
+    packet += "|DO:";
+    packet += String(currentDO);
+
+    // Existing DS18B20 temperature
+    packet += "|Temp:";
+    packet += String(currentTemp);
+
+    // Existing Tank B volume
+    packet += "|TBV:";
+    packet += String(currentVolume);
+
+    // DHT11 ambient temperature
+    packet += "|AT:";
+    packet += String(currentAmbientTemp);
+
+    // DHT11 ambient humidity
+    packet += "|AH:";
+    packet += String(currentHumidity);
+
+    // Node identifier
+    packet += "|";
+    packet += NODE_NAME;
+    packet += ":1";
+
+    return packet;
+}
+
+
+// ============================================================
+// BUILD FINAL PACKET
+// ============================================================
+//
+// If Node 1 has been received:
+//
+// |NODE1 DATA|DO:...|Temp:...|TBV:...|AT:...|AH:...|node2:1;
+//
+// If Node 1 has NEVER been received:
+//
+// |DO:...|Temp:...|TBV:...|AT:...|AH:...|node2:1;
+//
+// ============================================================
+
+String buildFinalPacket()
+{
+    String localSensors =
+        buildLocalSensorPacket();
+
+
+    String finalPacket = "";
+
+
+    // --------------------------------------------------------
+    // Add LAST KNOWN Node 1 data
+    // --------------------------------------------------------
+
+    if (lastNode1Data.length() > 0)
+    {
+        finalPacket += lastNode1Data;
+    }
+
+
+    // --------------------------------------------------------
+    // Add Node 2 data
+    // --------------------------------------------------------
+
+    finalPacket += localSensors;
+
+
+    // --------------------------------------------------------
+    // Final terminator
+    // --------------------------------------------------------
+
+    finalPacket += ";";
+
+
+    return finalPacket;
+}
+
+
+// ============================================================
+// SEND NODE 2 DATA BACK TO NODE 1
+// ============================================================
+//
+// Node 2 uses the same UART used to receive Node 1.
+//
+// GPIO26 = TX from Node 2
+// GPIO25 = RX to Node 2
+//
+// This sends the Node 2 local sensor packet only.
+//
+// Example:
+//
+// |DO:8|Temp:25|TBV:123|AT:27|AH:61|node2:1;
+//
+// ============================================================
+
+void sendDataToNode1()
+{
+    String reversePacket =
+        buildLocalSensorPacket();
+
+    InSerial.println(reversePacket);
+
+
+    Serial.println();
+    Serial.println("<<< NODE 2 DATA SENT BACK TO NODE 1 >>>");
+    Serial.print("Node 2 -> Node 1: ");
+    Serial.println(reversePacket);
+    Serial.println("================================");
+}
+
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop()
+{
+    // ========================================================
+    // 1. CHECK NODE 1 UART
+    // ========================================================
+    //
+    // This happens FIRST.
+    //
+    // If Node 1 sent something since the previous loop,
+    // it gets stored immediately.
+    //
+    // If Node 1 sent nothing:
+    //
+    // lastNode1Data remains unchanged.
+    //
+    // ========================================================
+
+    readNode1UART();
+
+
+    // ========================================================
+    // 2. READ NODE 2 SENSORS
+    // ========================================================
+
+    currentTemp =
+        readTemperature();
+
+
+    currentDO =
+        readDissolvedOxygen(
+            currentTemp
+        );
+
+
+    currentVolume =
+        readTankVolume();
+
+
+    // ========================================================
+    // 3. READ DHT11
+    // ========================================================
+
+    readDHT11();
+
+
+    // ========================================================
+    // 4. BUILD FINAL PACKET
+    // ========================================================
+
+    String outboundData =
+        buildFinalPacket();
+
+
+    // ========================================================
+    // 5. DEBUG
+    // ========================================================
+
+    Serial.println();
+    Serial.println("------------- NODE 2 DEBUG -------------");
+
+
+    Serial.print("Buffered Node 1 Data: ");
+
+    if (lastNode1Data.length() > 0)
+    {
+        Serial.println(lastNode1Data);
+    }
+    else
+    {
+        Serial.println("NONE YET");
+    }
+
+
+    Serial.print("Node 2 Data: ");
+    Serial.println(
+        buildLocalSensorPacket()
+    );
+
+
+    Serial.print("Final packet: ");
+    Serial.println(outboundData);
+
+
+    Serial.println(
+        "----------------------------------------"
+    );
+
+
+    // ========================================================
+    // 6. SEND FINAL DATA TO NODE 3
+    // ========================================================
+
+    OutSerial.println(outboundData);
+
+
+    // ========================================================
+    // 7. SEND NODE 2 DATA BACK TO NODE 1
+    // ========================================================
+
+    sendDataToNode1();
+
+
+    // ========================================================
+    // 8. REQUIRED 20 ms DELAY
+    // ========================================================
+
+    delay(20);
+}
+```
+#include <Arduino.h>
+
+HardwareSerial InSerial(1);  // RX=25, TX=26
+HardwareSerial OutSerial(2); // RX=32, TX=33
+
+const String NODE_NAME = "node3";
+unsigned long lastReceivedTime = 0;
+const unsigned long TIMEOUT_MS = 2000;
+
+const byte SENSOR_PIN = 23;          
+volatile uint16_t pulseCount = 0;    
+float flowRate = 0.0;
+unsigned long lastFlowMillis = 0;
+const float CALIBRATION_FACTOR = 5.5; 
+
+void IRAM_ATTR pulseCounterISR() {
+  pulseCount++;
+}
+
+void setup() {
+  Serial.begin(115200);
+  InSerial.begin(9600, SERIAL_8N1, 25, 26);
+  InSerial.setTimeout(50);
+  OutSerial.begin(9600, SERIAL_8N1, 32, 33);
+  
+  pinMode(SENSOR_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), pulseCounterISR, FALLING);
+  
+  lastReceivedTime = millis();
+  lastFlowMillis = millis();
+}
+
+float getFLM() {
+  if (millis() - lastFlowMillis >= 1000) {
+    noInterrupts(); 
+    uint16_t currentPulses = pulseCount;
+    pulseCount = 0;   
+    interrupts();   
+    
+    flowRate = (float)currentPulses / CALIBRATION_FACTOR; 
+    lastFlowMillis += 1000; // Fixed timing drift bug
+  }
+  return flowRate;
+}
+
+void loop() {
+  bool dataReceived = false;
+  String incomingData = "";
+
+  if (InSerial.available() > 0) {
+    incomingData = InSerial.readStringUntil(';');
+    incomingData.trim();
+    if (incomingData.length() > 0) {
+      dataReceived = true;
+      lastReceivedTime = millis();
+    }
+  }
+
+  // Debug: Log incoming serial state
+  Serial.println("--- DEBUG LOG ---");
+  Serial.println("Received Raw Packet: [" + (dataReceived ? incomingData : "NONE") + "]");
+
+  // Retrieve flow meter reading
+  float currentFlow = getFLM();
+  Serial.println("Sensor Flow Rate: " + String(currentFlow, 1) + " L/min");
+
+  String NodeData = "FLM:" + String(currentFlow, 1) + "|" + NODE_NAME + ":1;";
+
+  if (dataReceived) {
+    String outboundData = incomingData + "|" + NodeData;
+    OutSerial.println(outboundData);
+    Serial.println("Forwarded Packet Sent: " + outboundData);
+    Serial.println("------------------\n");
+  } 
+  else if (millis() - lastReceivedTime > TIMEOUT_MS) {
+    Serial.println("ALERT: Upstream Timeout detected.");
+    String outboundData = "node1:0|node2:0|" + NodeData;
+    Serial.println("Timeout Fallback Packet Sent: " + outboundData);
+    OutSerial.println(outboundData);
+    
+    // Fixed continuous timeout spam: set timestamp far into the future 
+    // or rely on a state flag so it only triggers once per outage event.
+    lastReceivedTime = millis() + 100000; // Mutes spam until new data resets it
+    Serial.println("------------------\n");
+  } else {
+    Serial.println("Status: Waiting for data or within timeout window...");
+    Serial.println("------------------\n");
+  }
+  delay(20);
+}
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <DHT.h>
+
+// ============================================================
+// SERIAL SETUP
+// ============================================================
+
+HardwareSerial InSerial(2);   // RX=25, TX=26 (From Node 3)
+HardwareSerial OutSerial(1);  // RX=32, TX=33 (To Next Node)
+
+const String NODE_NAME = "node4";
+
+unsigned long lastTxTime = 0;
+const unsigned long TX_INTERVAL_MS = 500;
+
+String incomingData = "";
+
+// ============================================================
+// PIN ALLOCATIONS
+// ============================================================
+
+// --- Ultrasonic ---
+#define TRIG_PIN 4
+#define ECHO_PIN 2
+
+// --- Analog sensors ---
+const int PH_PIN = 13;
+const int TURBIDITY_PIN = 14;
+const int EC_PIN = 12;
+
+// --- Submerged temperature DS18B20 ---
+#define DS18B20_PIN 27
+
+// --- Ambient DHT11 ---
+#define DHT_PIN 5
+#define DHT_TYPE DHT11
+
+// ============================================================
+// LCD
+// ============================================================
+
+LiquidCrystal_I2C lcd(0x27, 16, 4);
+
+// ============================================================
+// TEMPERATURE SENSOR INITIALIZATION
+// ============================================================
+
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature submergedTempSensor(&oneWire);
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ============================================================
+// TANK DIMENSIONS
+// ============================================================
+
+const float TANK_HEIGHT = 178.0;
+const float TANK_RADIUS = 59.5;
+
+// ============================================================
+// ADC SETTINGS
+// ============================================================
+
+const float ESP32_VREF = 3.3;
+const int ADC_RESOLUTION = 4095;
+
+// ============================================================
+// GLOBAL SENSOR VARIABLES
+// ============================================================
+
+float phValue = 0.0;
+float ntu = 0.0;
+float ecValue = 0.0;
+
+float submergedTemperature = 0.0;
+float ambientTemperature = 0.0;
+float ambientHumidity = 0.0;
+
+int evVolume = 0;
+
+// ============================================================
+// 16x4 LCD ROW ADDRESS FIX
+// ============================================================
+
+void lcdSetRow(uint8_t row) {
+  const uint8_t rowAddress[] = {
+    0x00,   // Row 1
+    0x40,   // Row 2
+    0x10,   // Row 3
+    0x50    // Row 4
+  };
+
+  if (row > 3) {
+    return;
+  }
+
+  lcd.command(0x80 | rowAddress[row]);
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  InSerial.begin(9600, SERIAL_8N1, 25, 26);
+  InSerial.setTimeout(30);
+
+  OutSerial.begin(9600, SERIAL_8N1, 32, 33);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  Wire.begin(21, 22);
+  lcd.begin(16, 4);
+  lcd.backlight();
+
+  submergedTempSensor.begin();
+  dht.begin();
+
+  lcd.clear();
+  lcdSetRow(0);
+  lcd.print("Water Quality");
+  lcdSetRow(1);
+  lcd.print("Monitor Booting");
+
+  delay(1500);
+  lcd.clear();
+
+  Serial.println("========================================");
+  Serial.println("Node 4 System Initialized");
+  Serial.println("16x4 LCD");
+  Serial.println("DS18B20: GPIO27");
+  Serial.println("DHT11: GPIO5");
+  Serial.println("========================================");
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+  if (InSerial.available()) {
+    String temp = InSerial.readStringUntil('\n');
+    temp.trim();
+
+    while (temp.length() > 0 && (temp[0] < 32 || temp[0] > 126)) {
+      temp.remove(0, 1);
+    }
+
+    if (temp.length() > 0) {
+      incomingData = temp;
+    }
+  }
+
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - lastTxTime >= TX_INTERVAL_MS) {
+    lastTxTime = currentMillis;
+
+    // --- Read pH ---
+    int phRaw = analogRead(PH_PIN);
+    float phVoltage = (phRaw * ESP32_VREF) / ADC_RESOLUTION;
+    phValue = 3.5 * phVoltage + 0.0;
+
+    // --- Read Turbidity ---
+    int turbRaw = analogRead(TURBIDITY_PIN);
+    float turbVoltage = (turbRaw * ESP32_VREF) / ADC_RESOLUTION;
+
+    if (turbVoltage < 2.5) {
+      ntu = 3000;
+    } else {
+      ntu = -1120.4 * (turbVoltage * turbVoltage) + 5742.3 * turbVoltage - 4353.8;
+    }
+    if (ntu < 0) {
+      ntu = 0;
+    }
+
+    // --- Read Electrical Conductivity ---
+    int ecRaw = analogRead(EC_PIN);
+    float ecVoltage = (ecRaw * ESP32_VREF) / ADC_RESOLUTION;
+    ecValue = 1.0 * ecVoltage;
+
+    // --- Read DS18B20 Submerged Temperature ---
+    submergedTempSensor.requestTemperatures();
+    float newSubmergedTemperature = submergedTempSensor.getTempCByIndex(0);
+    if (newSubmergedTemperature != DEVICE_DISCONNECTED_C) {
+      submergedTemperature = newSubmergedTemperature;
+    }
+
+    // --- Read DHT11 Ambient Temperature + Humidity ---
+    float newAmbientTemperature = dht.readTemperature();
+    float newAmbientHumidity = dht.readHumidity();
+
+    if (!isnan(newAmbientTemperature)) {
+      ambientTemperature = newAmbientTemperature;
+    }
+    if (!isnan(newAmbientHumidity)) {
+      ambientHumidity = newAmbientHumidity;
+    }
+
+    // --- Calculate Effluent Tank Volume ---
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+
+    long duration = pulseIn(ECHO_PIN, HIGH, 20000);
+    float distance = duration * 0.0343 / 2.0;
+    float waterHeight = TANK_HEIGHT - distance;
+
+    if (waterHeight < 0 || duration == 0) {
+      waterHeight = 0;
+    }
+
+    evVolume = (3.14159 * TANK_RADIUS * TANK_RADIUS * waterHeight) / 1000.0;
+
+    // ========================================================
+    // LCD DISPLAY
+    // ========================================================
+
+    lcd.clear();
+
+    // Line 1
+    lcdSetRow(0);
+    lcd.print("EV:");
+    lcd.print(evVolume);
+    lcd.print("L");
+    lcd.print(" pH:");
+    lcd.print(phValue, 1);
+
+    // Line 2
+    lcdSetRow(1);
+    lcd.print("TU:");
+    lcd.print((int)ntu);
+    lcd.print(" EC:");
+    lcd.print(ecValue, 1);
+    lcd.print("mS");
+
+    // Line 3
+    lcdSetRow(2);
+    lcd.print("ST:");
+    lcd.print(submergedTemperature, 1);
+    lcd.print("C");
+    lcd.print(" AT:");
+    lcd.print(ambientTemperature, 1);
+    lcd.print("C");
+
+    // Line 4
+    lcdSetRow(3);
+    lcd.print("AH:");
+    lcd.print((int)ambientHumidity);
+    lcd.print("%");
+
+    // ========================================================
+    // BUILD PAYLOAD & TRANSMIT
+    // ========================================================
+
+    String NodeData = "pH:" + String(phValue, 1) +
+                      "|Turb:" + String((int)ntu) +
+                      "|EC:" + String(ecValue, 1) +
+                      "|EV:" + String(evVolume) +
+                      "|ST:" + String(submergedTemperature, 1) +
+                      "|AT:" + String(ambientTemperature, 1) +
+                      "|AH:" + String(ambientHumidity, 0) +
+                      "|" + NODE_NAME + ":1;";
+
+    String outboundData;
+    if (incomingData.length() > 0) {
+      String cleanIncoming = incomingData;
+      if (cleanIncoming.endsWith(";")) {
+        cleanIncoming.remove(cleanIncoming.length() - 1);
+      }
+      outboundData = cleanIncoming + "|" + NodeData;
+    } else {
+      outboundData = NodeData;
+    }
+
+    OutSerial.print(outboundData + "\n");
+  }
+}
